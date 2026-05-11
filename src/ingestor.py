@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
@@ -35,6 +35,18 @@ class SongCandidate:
 	producer_name: str
 	source_urls: List[str] = field(default_factory=list)
 	vocaloids: List[str] = field(default_factory=list)
+	# preserve all webLinks metadata from VocaDB for downstream classification
+	all_weblinks: List[Dict[str, Any]] = field(default_factory=list)
+	# derived classification of useful media links with an "is_official" flag
+	classified_links: List[Dict[str, Any]] = field(default_factory=list)
+	# enriched metadata fields
+	duration_seconds: Optional[float] = None
+	bpm: Optional[float] = None
+	tags: List[str] = field(default_factory=list)
+	languages: List[str] = field(default_factory=list)
+	published_at: Optional[str] = None
+	statistics: Dict[str, Any] = field(default_factory=dict)
+	versions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -83,10 +95,14 @@ def _http_get_json(
 	raise IngestionError(f"Request failed after retries for {url}. last_error={last_error}")
 
 
-def extract_media_urls(song_payload: Dict[str, Any]) -> List[str]:
-	"""Extract usable media URLs from a song payload, with preference ordering."""
+def extract_media_urls(song_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+	"""Extract usable media URLs from a song payload and classify links.
+
+	Returns a list of dicts: {"url": str, "is_official": bool, "raw": <original link dict>}.
+	For backward compatibility, callers that only need URLs can extract the `url` field.
+	 """
 	links = song_payload.get("webLinks") or []
-	candidates: List[str] = []
+	results: List[Dict[str, Any]] = []
 
 	for link in links:
 		if not isinstance(link, dict):
@@ -94,20 +110,30 @@ def extract_media_urls(song_payload: Dict[str, Any]) -> List[str]:
 		url = (link.get("url") or "").strip()
 		if not url:
 			continue
-		lower = url.lower()
-		if "youtube.com" in lower or "youtu.be" in lower:
-			candidates.append(url)
-			continue
-		if "nicovideo.jp" in lower or "nico.ms" in lower:
-			candidates.append(url)
 
-	# Preserve order but remove duplicates.
-	deduped: List[str] = []
+		lower = url.lower()
+		# simple host filtering for common media hosts
+		if not ("youtube.com" in lower or "youtu.be" in lower or "nicovideo.jp" in lower or "nico.ms" in lower):
+			continue
+
+		# heuristic for official flag
+		is_official = False
+		if isinstance(link.get("isOfficial"), bool) and link.get("isOfficial"):
+			is_official = True
+		cat = link.get("category") or link.get("type") or ""
+		if isinstance(cat, str) and "official" in cat.lower():
+			is_official = True
+
+		results.append({"url": url, "is_official": is_official, "raw": link})
+
+	# Preserve order but remove duplicates by url
+	deduped: List[Dict[str, Any]] = []
 	seen = set()
-	for url in candidates:
-		if url not in seen:
-			seen.add(url)
-			deduped.append(url)
+	for item in results:
+		u = item["url"]
+		if u not in seen:
+			seen.add(u)
+			deduped.append(item)
 	return deduped
 
 
@@ -190,13 +216,31 @@ class VocaDBIngestor:
 			LOGGER.error("producer_not_found producer_name=%s", producer_name)
 			raise ProducerNotFoundError(f"Producer not found: {producer_name}")
 
-		# Prefer exact case-insensitive match; fallback to first result.
+		# Prefer an exact case-insensitive match, then probe the top results for one
+		# that actually has songs. This avoids selecting artist groups like
+		# "Kikuo Sound Works" when the intended producer is a narrower artist entry.
 		selected = items[0]
 		for item in items:
 			name = str(item.get("name") or "")
 			if name.lower() == query_name.lower():
 				selected = item
 				break
+		else:
+			for item in items[:5]:
+				artist_id = _safe_int(item.get("id"))
+				if artist_id <= 0:
+					continue
+				probe_url = self._build_song_search_url(producer_id=artist_id, start=0)
+				probe_payload = _http_get_json(
+					url=probe_url,
+					timeout_seconds=self.timeout_seconds,
+					max_retries=self.max_retries,
+					retry_backoff_seconds=self.retry_backoff_seconds,
+				)
+				probe_items = probe_payload.get("items") or []
+				if any(isinstance(song, dict) and song.get("webLinks") for song in probe_items):
+					selected = item
+					break
 
 		producer = Producer(
 			vocadb_artist_id=_safe_int(selected.get("id")),
@@ -208,14 +252,20 @@ class VocaDBIngestor:
 		self,
 		producer: Producer,
 		max_songs: Optional[int] = None,
-	) -> List[SongCandidate]:
-		"""Fetch producer songs with pagination and normalize response payloads."""
-		results: List[SongCandidate] = []
+	) -> Tuple[List[SongCandidate], List[SongCandidate]]:
+		"""Fetch producer songs with pagination and normalize response payloads.
+
+		Returns a tuple: (with_media, without_media).
+		"""
+		with_media: List[SongCandidate] = []
+		without_media: List[SongCandidate] = []
 		seen_song_ids = set()
 		start = 0
 
 		while True:
-			if max_songs is not None and len(results) >= max_songs:
+			# stop if we've collected enough overall (both lists combined)
+			total_count = len(with_media) + len(without_media)
+			if max_songs is not None and total_count >= max_songs:
 				break
 
 			url = self._build_song_search_url(producer_id=producer.vocadb_artist_id, start=start)
@@ -236,30 +286,35 @@ class VocaDBIngestor:
 				if song_id <= 0 or song_id in seen_song_ids:
 					continue
 
-				source_urls = extract_media_urls(item)
-				if not source_urls:
-					LOGGER.info("no_source_url vocadb_song_id=%s", song_id)
-					continue
+				classified = extract_media_urls(item)
+				urls = [c["url"] for c in classified]
 
 				candidate = SongCandidate(
 					vocadb_song_id=song_id,
 					title=str(item.get("name") or "Untitled"),
 					producer_vocadb_id=producer.vocadb_artist_id,
 					producer_name=producer.name,
-					source_urls=source_urls,
+					source_urls=urls,
 					vocaloids=_extract_vocaloids(item),
+					all_weblinks=item.get("webLinks") or [],
+					classified_links=classified,
 				)
 				seen_song_ids.add(song_id)
-				results.append(candidate)
 
-				if max_songs is not None and len(results) >= max_songs:
+				if urls:
+					with_media.append(candidate)
+				else:
+					without_media.append(candidate)
+
+				total_count = len(with_media) + len(without_media)
+				if max_songs is not None and total_count >= max_songs:
 					break
 
 			if len(items) < self.page_size:
 				break
 			start += self.page_size
 
-		return results
+		return with_media, without_media
 
 	def _build_song_search_url(self, producer_id: int, start: int) -> str:
 		fields = [
@@ -292,8 +347,11 @@ def get_song_candidates_for_producer(
 	retry_backoff_seconds: float = 1.0,
 	page_size: int = 50,
 	max_songs: Optional[int] = None,
-) -> List[SongCandidate]:
-	"""Convenience helper used by orchestration code."""
+) -> Dict[str, List[SongCandidate]]:
+	"""Convenience helper used by orchestration code.
+
+	Returns a dict with keys `with_media` and `without_media`.
+	"""
 	ingestor = VocaDBIngestor(
 		base_url=base_url,
 		timeout_seconds=timeout_seconds,
@@ -302,4 +360,107 @@ def get_song_candidates_for_producer(
 		page_size=page_size,
 	)
 	producer = ingestor.search_producer(producer_name)
-	return ingestor.fetch_songs_for_producer(producer=producer, max_songs=max_songs)
+	with_media, without_media = ingestor.fetch_songs_for_producer(producer=producer, max_songs=max_songs)
+	return {"with_media": with_media, "without_media": without_media}
+
+
+def normalize_song_metadata(candidate: SongCandidate, song_payload: Dict[str, Any]) -> SongCandidate:
+	"""Enrich a SongCandidate with additional metadata extracted from VocaDB song payload.
+
+	This helper is conservative: it detects common fields when present and otherwise
+	leaves defaults in place.
+	 """
+	# extract duration
+	duration = None
+	for key in ("lengthSeconds", "length", "durationSeconds", "duration"):
+		v = song_payload.get(key)
+		if isinstance(v, (int, float)):
+			duration = float(v)
+			break
+		if isinstance(v, str) and v:
+			# try parse mm:ss or h:mm:ss
+			parts = v.split(":")
+			try:
+				parts = [int(p) for p in parts]
+				if len(parts) == 2:
+					duration = parts[0] * 60 + parts[1]
+				elif len(parts) == 3:
+					duration = parts[0] * 3600 + parts[1] * 60 + parts[2]
+				break
+			except Exception:
+				pass
+
+	# extract bpm
+	bpm = None
+	for key in ("bpm", "defaultBpm", "tempo"):
+		v = song_payload.get(key)
+		if isinstance(v, (int, float)):
+			bpm = float(v)
+			break
+		if isinstance(v, str):
+			try:
+				bpm = float(v)
+				break
+			except Exception:
+				pass
+
+	# tags
+	tags: List[str] = []
+	raw_tags = song_payload.get("tags") or []
+	if isinstance(raw_tags, list):
+		for t in raw_tags:
+			if isinstance(t, dict):
+				name = t.get("name") or t.get("tag")
+				if name:
+					tags.append(str(name))
+			elif isinstance(t, str):
+				tags.append(t)
+
+	# languages
+	languages: List[str] = []
+	lang = song_payload.get("language") or song_payload.get("languages") or song_payload.get("songLanguages")
+	if isinstance(lang, list):
+		languages = [str(x) for x in lang if x]
+	elif isinstance(lang, str) and lang:
+		languages = [lang]
+
+	# published date
+	published_at = None
+	for key in ("publishDate", "published", "publish_date", "released"):
+		v = song_payload.get(key)
+		if isinstance(v, str) and v:
+			published_at = v
+			break
+
+	# statistics (views, favorites, ratings)
+	stats = {}
+	raw_stats = song_payload.get("stats") or song_payload.get("statistics") or {}
+	if isinstance(raw_stats, dict):
+		stats = raw_stats
+
+	# versions / other media
+	versions: List[Dict[str, Any]] = []
+	raw_versions = song_payload.get("otherVersions") or song_payload.get("versions") or []
+	if isinstance(raw_versions, list):
+		for v in raw_versions:
+			if isinstance(v, dict):
+				versions.append(v)
+
+	# return a new SongCandidate (dataclass is frozen)
+	return SongCandidate(
+		vocadb_song_id=candidate.vocadb_song_id,
+		title=candidate.title,
+		producer_vocadb_id=candidate.producer_vocadb_id,
+		producer_name=candidate.producer_name,
+		source_urls=candidate.source_urls,
+		vocaloids=candidate.vocaloids,
+		all_weblinks=candidate.all_weblinks,
+		classified_links=candidate.classified_links,
+		duration_seconds=duration,
+		bpm=bpm,
+		tags=tags,
+		languages=languages,
+		published_at=published_at,
+		statistics=stats,
+		versions=versions,
+	)
