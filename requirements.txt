@@ -2,7 +2,9 @@ pytest>=7.0
 
 # Core pipeline dependencies (add when implementing pipeline)
 yt-dlp
-# librosa
+librosa
 # pydub
-# numpy
+numpy
 # supabase-py
+psycopg2
+requests
