@@ -299,6 +299,7 @@ class VocaDBIngestor:
 					all_weblinks=item.get("webLinks") or [],
 					classified_links=classified,
 				)
+				candidate = normalize_song_metadata(candidate, item)
 				seen_song_ids.add(song_id)
 
 				if urls:
@@ -321,6 +322,7 @@ class VocaDBIngestor:
 			"Artists",
 			"WebLinks",
 			"MainPicture",
+			"Tags",
 		]
 		params = {
 			"artistId[]": str(producer_id),
@@ -410,7 +412,8 @@ def normalize_song_metadata(candidate: SongCandidate, song_payload: Dict[str, An
 	if isinstance(raw_tags, list):
 		for t in raw_tags:
 			if isinstance(t, dict):
-				name = t.get("name") or t.get("tag")
+				tag_info = t.get("tag") if isinstance(t.get("tag"), dict) else t
+				name = tag_info.get("name")
 				if name:
 					tags.append(str(name))
 			elif isinstance(t, str):

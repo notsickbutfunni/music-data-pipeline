@@ -43,10 +43,12 @@ def _load_dotenv_if_available(dotenv_path: Path) -> None:
             os.environ[key] = value
 
 
-def _require_env(name: str) -> str:
+def _require_env(name: str, strict: bool = True) -> str:
     value = os.getenv(name)
     if value is None or value.strip() == "":
-        raise ConfigError(f"Missing required environment variable: {name}")
+        if strict:
+            raise ConfigError(f"Missing required environment variable: {name}")
+        return ""
     return value.strip()
 
 
@@ -68,22 +70,22 @@ def _int_env(name: str, default: int) -> int:
         raise ConfigError(f"Environment variable {name} must be an integer.") from exc
 
 
-def load_config(env_file: str = ".env") -> AppConfig:
+def load_config(env_file: str = ".env", strict: bool = True) -> AppConfig:
     """Load and validate application configuration from environment variables."""
     _load_dotenv_if_available(Path(env_file))
 
-    account_id = _require_env("R2_ACCOUNT_ID")
+    account_id = _require_env("R2_ACCOUNT_ID", strict=strict)
 
     return AppConfig(
         vocadb_base_url=_optional_env("VOCADB_BASE_URL", "https://vocadb.net/api") or "https://vocadb.net/api",
         vocadb_timeout_seconds=_int_env("VOCADB_TIMEOUT_SECONDS", 20),
-        supabase_url=_require_env("SUPABASE_URL"),
-        supabase_service_key=_require_env("SUPABASE_SERVICE_KEY"),
+        supabase_url=_require_env("SUPABASE_URL", strict=strict),
+        supabase_service_key=_require_env("SUPABASE_SERVICE_KEY", strict=strict),
         supabase_schema=_optional_env("SUPABASE_SCHEMA", "public") or "public",
         r2_account_id=account_id,
-        r2_access_key_id=_require_env("R2_ACCESS_KEY_ID"),
-        r2_secret_access_key=_require_env("R2_SECRET_ACCESS_KEY"),
-        r2_bucket_name=_require_env("R2_BUCKET_NAME"),
+        r2_access_key_id=_require_env("R2_ACCESS_KEY_ID", strict=strict),
+        r2_secret_access_key=_require_env("R2_SECRET_ACCESS_KEY", strict=strict),
+        r2_bucket_name=_require_env("R2_BUCKET_NAME", strict=strict),
         r2_public_base_url=_optional_env("R2_PUBLIC_BASE_URL"),
         r2_endpoint_url=_optional_env(
             "R2_ENDPOINT_URL", f"https://{account_id}.r2.cloudflarestorage.com"

@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
 	args = parser.parse_args(argv)
 
 	try:
-		cfg = load_config(env_file=args.env_file)
+		cfg = load_config(env_file=args.env_file, strict=False)
 	except ConfigError as exc:
 		print(f"Configuration error: {exc}", file=sys.stderr)
 		return 2
@@ -73,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
 		"with_media": [asdict(song) for song in with_media],
 		"without_media": [asdict(song) for song in without_media],
 	}
+	if hasattr(sys.stdout, "reconfigure"):
+		sys.stdout.reconfigure(encoding="utf-8")
 	print(json.dumps(result, indent=2, ensure_ascii=False) if args.json else result)
 	return 0
 

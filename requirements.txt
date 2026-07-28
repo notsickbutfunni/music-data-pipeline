@@ -1,7 +1,7 @@
 pytest>=7.0
 
 # Core pipeline dependencies (add when implementing pipeline)
-# yt-dlp
+yt-dlp
 # librosa
 # pydub
 # numpy
