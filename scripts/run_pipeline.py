@@ -1,33 +1,31 @@
-# Сохраняет сырой JSON в staging_songs_raw.
-# Раскладывает данные по dim_songs, song_links, song_tags.
-# Скачивает 5–10 аудио-превью (downloader.py).
-# Считает базовые фичи (bpm, mean_pitch_hz, rms_energy) и пишет в fact_audio_features.
-
 import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
+
 import librosa
 import numpy as np
 import psycopg2
 from psycopg2.extras import execute_values
 import requests
 
+# Если у тебя есть готовый класс AudioDownloader с yt-dlp, импортируй его:
+# from src.downloader import AudioDownloader
+
 # ------------------------------------------------------------------
 # CONFIG & SETUP
 # ------------------------------------------------------------------
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("pipeline")
+logger = logging.getLogger("db_pipeline")
 
-# Параметры БД (замените на свои или читайте из os.getenv)
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "music_db")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "postgres")
 
-# Директория для временных аудио-файлов
 AUDIO_DIR = Path("data/downloads")
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -45,10 +43,10 @@ def get_db_connection():
 # ------------------------------------------------------------------
 # 1. AUDIO PROCESSING (Librosa)
 # ------------------------------------------------------------------
-def extract_audio_features(file_path: Path) -> dict:
+def extract_audio_features(file_path: Path) -> dict[str, float] | None:
     """Извлекает базовые аудио-фичи из mp3/wav файла."""
     try:
-        # Загружаем первые 30 секунд аудио (sr=22050 по умолчанию)
+        # Загружаем аудио (до 30 сек)
         y, sr = librosa.load(file_path, duration=30.0)
 
         # 1. BPM (Tempo)
@@ -76,38 +74,17 @@ def extract_audio_features(file_path: Path) -> dict:
         return None
 
 
-def download_audio_preview(url: str, song_id: int) -> Path:
-    """Скачивает превью файла во временную папку."""
-    target_path = AUDIO_DIR / f"{song_id}_preview.mp3"
-    if target_path.exists():
-        return target_path
-
-    try:
-        response = requests.get(url, timeout=15, stream=True)
-        response.raise_for_status()
-        with open(target_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return target_path
-    except Exception as e:
-        logger.warning(f"Failed to download audio for song {song_id}: {e}")
-        return None
-
-
 # ------------------------------------------------------------------
 # 2. PERSISTENCE LAYER (PostgreSQL)
 # ------------------------------------------------------------------
-def process_and_save_payload(json_data: dict, conn):
-    """Раскладывает JSON по нормализованным таблицам Postgres."""
+def process_and_save_payload(json_data: dict[str, Any], conn):
+    """Раскладывает новый формат JSON VocaDB по нормализованным таблицам Postgres."""
     cursor = conn.cursor()
 
-    producer_name = json_data.get("producer", "Unknown")
-    songs_with_media = json_data.get("with_media", [])
-    songs_without_media = json_data.get("without_media", [])
-    all_songs = songs_with_media + songs_without_media
-
+    producers_data = json_data.get("data", [])
     logger.info(
-        f"Processing producer '{producer_name}' with {len(all_songs)} total songs..."
+        f"Processing batch: {len(producers_data)} producers, "
+        f"{json_data.get('total_songs_found', 0)} total songs..."
     )
 
     # --- A. Save Staging Raw Payload ---
@@ -116,74 +93,54 @@ def process_and_save_payload(json_data: dict, conn):
         INSERT INTO staging_songs_raw (producer_name, payload)
         VALUES (%s, %s);
     """,
-        (producer_name, json.dumps(json_data)),
+        ("voca_batch_ingest", json.dumps(json_data)),
     )
 
-    # Собираем батчи для сохранения
+    producers_batch = []
     songs_batch = []
     links_batch = []
-    tags_set = set()
-    song_tags_batch = []
 
-    for song in all_songs:
-        song_id = song["vocadb_song_id"]
-        title = song["title"]
-        duration = song.get("duration_seconds")
-        bpm = song.get("bpm")
-        published_at = song.get("published_at")
+    for producer in producers_data:
+        p_id = producer["producer_id"]
+        p_name = producer["producer_name"]
+        followers = producer.get("followers", 0)
 
-        songs_batch.append((song_id, title, duration, bpm, published_at))
+        producers_batch.append((p_id, p_name, followers))
 
-        # Собираем ссылки
-        for link in song.get("classified_links", []):
-            links_batch.append(
-                (
-                    song_id,
-                    link["url"],
-                    link.get("is_official", False),
-                    link.get("raw", {}).get("category", "Official"),
-                )
-            )
+        for song in producer.get("songs", []):
+            song_id = song["song_id"]
+            title = song["title"]
+            published_at = song.get("publish_date")
+            pv_url = song.get("pv_url")
 
-        # Собираем теги
-        for tag in song.get("tags", []):
-            tags_set.add(tag)
-            song_tags_batch.append((song_id, tag))
+            # В новом формате bpm/duration приходят позже после анализа librosa
+            songs_batch.append((song_id, p_id, title, published_at))
 
-    # --- B. Upsert into dim_songs ---
-    songs_sql = """
-        INSERT INTO dim_songs (vocadb_song_id, title, duration_seconds, bpm, published_at)
-        VALUES %s
-        ON CONFLICT (vocadb_song_id) DO UPDATE SET
-            title = EXCLUDED.title,
-            duration_seconds = EXCLUDED.duration_seconds,
-            bpm = EXCLUDED.bpm;
-    """
-    execute_values(cursor, songs_sql, songs_batch)
+            if pv_url:
+                links_batch.append((song_id, pv_url, True, "YouTube"))
 
-    # --- C. Upsert Tags ---
-    if tags_set:
-        tags_sql = """
-            INSERT INTO dim_tags (name) VALUES %s
-            ON CONFLICT (name) DO NOTHING;
+    # --- B. Upsert into dim_producers (если есть такая таблица) ---
+    if producers_batch:
+        producers_sql = """
+            INSERT INTO dim_producers (producer_id, name, followers_count)
+            VALUES %s
+            ON CONFLICT (producer_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                followers_count = EXCLUDED.followers_count;
         """
-        execute_values(cursor, tags_sql, [(t,) for t in tags_set])
+        # Закомментируй, если dim_producers еще не создана
+        # execute_values(cursor, producers_sql, producers_batch)
 
-        # Map tag_name -> tag_id
-        cursor.execute("SELECT name, tag_id FROM dim_tags;")
-        tag_map = dict(cursor.fetchall())
-
-        song_tag_ids = [
-            (s_id, tag_map[t_name])
-            for s_id, t_name in song_tags_batch
-            if t_name in tag_map
-        ]
-
-        song_tags_sql = """
-            INSERT INTO song_tags (song_id, tag_id) VALUES %s
-            ON CONFLICT DO NOTHING;
+    # --- C. Upsert into dim_songs ---
+    if songs_batch:
+        songs_sql = """
+            INSERT INTO dim_songs (vocadb_song_id, producer_id, title, published_at)
+            VALUES %s
+            ON CONFLICT (vocadb_song_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                published_at = EXCLUDED.published_at;
         """
-        execute_values(cursor, song_tags_sql, song_tag_ids)
+        execute_values(cursor, songs_sql, songs_batch)
 
     # --- D. Upsert Links ---
     if links_batch:
@@ -195,25 +152,27 @@ def process_and_save_payload(json_data: dict, conn):
         execute_values(cursor, links_sql, links_batch)
 
     conn.commit()
-    logger.info("Successfully populated relational tables!")
+    logger.info("Successfully populated relational tables (dim_songs & links)!")
 
-    # --- E. Extract Audio Features for playable songs (Max 5 for test) ---
+    # --- E. Extract Audio Features for downloaded local MP3s ---
     logger.info("Starting Audio Feature Extraction pipeline...")
     pipeline_version = "v1.0"
     processed_count = 0
 
-    for song in songs_with_media[:5]:  # Берем первые 5 треков для быстроты
-        song_id = song["vocadb_song_id"]
-        source_urls = song.get("source_urls", [])
+    # Проверяем локально скачанные файлы в data/downloads
+    for producer in producers_data:
+        for song in producer.get("songs", []):
+            song_id = song["song_id"]
 
-        if not source_urls:
-            continue
+            # Ищем, скачан ли файл (например: 28_13351.mp3 или 13351_preview.mp3)
+            possible_files = list(AUDIO_DIR.glob(f"*{song_id}*.mp3"))
 
-        audio_url = source_urls[0]
-        audio_path = download_audio_preview(audio_url, song_id)
+            if not possible_files:
+                continue
 
-        if audio_path:
+            audio_path = possible_files[0]
             features = extract_audio_features(audio_path)
+
             if features:
                 cursor.execute(
                     """
@@ -234,7 +193,9 @@ def process_and_save_payload(json_data: dict, conn):
                     ),
                 )
                 processed_count += 1
-                logger.info(f"Extracted features for song ID {song_id}: {features}")
+                logger.info(
+                    f"Extracted features for song ID {song_id}: {features}"
+                )
 
     conn.commit()
     cursor.close()
@@ -247,12 +208,12 @@ def process_and_save_payload(json_data: dict, conn):
 # MAIN ENTRYPOINT
 # ------------------------------------------------------------------
 def main():
-    # Путь к файлу с результатами работы вашего инжестора
-    json_input_path = Path("logs/test_ingestor_nashimoto.json")
+    # Путь к нашему новому сгенерированному JSON
+    json_input_path = Path("data/ingest_output.json")
 
     if not json_input_path.exists():
         logger.error(
-            f"Input file {json_input_path} not found. Please run ingestor first!"
+            f"Input file {json_input_path} not found. Run run_ingest.py first!"
         )
         return
 
@@ -260,7 +221,6 @@ def main():
     with open(json_input_path, "r", encoding="utf-8") as f:
         json_payload = json.load(f)
 
-    # Подключение и запуск
     conn = get_db_connection()
     try:
         process_and_save_payload(json_payload, conn)

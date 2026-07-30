@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import Any
+import requests
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -172,6 +174,46 @@ def _extract_vocaloids(song_payload: Dict[str, Any]) -> List[str]:
 	return deduped
 
 
+def get_top_producers(
+    limit: int = 100, base_url: str = "https://vocadb.net/api"
+) -> list[dict[str, Any]]:
+    """Получает список самых популярных продюсеров VocaDB по количеству подписчиков."""
+    url = f"{base_url.rstrip('/')}/artists"
+
+    params = {
+        "artistTypes": "Producer",  # Фильтр только по продюсерам
+        "sort": "FollowerCount",  # Сортировка по подписчикам
+        "maxResults": min(limit, 100),  # VocaDB отдает макс. 100 за 1 запрос
+        "fields": "AdditionalNames,MainPicture",  # Поля, точно поддерживаемые API
+        "lang": "Default",
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "VocaAnalyticsPipeline/1.0",
+    }
+
+    response = requests.get(url, params=params, headers=headers, timeout=15)
+
+    # Если все еще получаете 400, выводим подробное тело ошибки от VocaDB
+    if response.status_code == 400:
+        raise ValueError(
+            f"VocaDB API вернул 400 Bad Request. Ответ сервера: {response.text}"
+        )
+
+    response.raise_for_status()
+    data = response.json()
+
+    producers = []
+    for item in data.get("items", []):
+        producers.append({
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "followers": item.get("followerCount", 0),
+        })
+
+    return producers
+
 class VocaDBIngestor:
 	"""Typed client for producer/song metadata ingestion from VocaDB."""
 
@@ -340,6 +382,53 @@ class VocaDBIngestor:
 		encoded = encoded.replace("artistId%5B%5D", quote_plus("artistId[]"))
 		return f"{self.base_url}/songs?{encoded}"
 
+def get_songs_by_artist_id(
+    artist_id: int, max_songs: int = 10, base_url: str = "https://vocadb.net/api"
+) -> list[dict[str, Any]]:
+    """Запрашивает песни продюсера напрямую по его VocaDB Artist ID."""
+    url = f"{base_url.rstrip('/')}/songs"
+
+    # artistId[] с квадратными скобками — требование VocaDB API для массивов
+    params = {
+        "artistId[]": [artist_id],
+        "sort": "RatingScore",  # Топ по лайкам/добавлениям в избранное
+        "onlyWithPV": "true",  # Только с доступным видео/аудио
+        "pvServices": "Youtube",  # YouTube в приоритете
+        "maxResults": max_songs,
+        "fields": "PVs,Artists,Tags",
+        "lang": "Default",
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "VocaAnalyticsPipeline/1.0",
+    }
+
+    response = requests.get(url, params=params, headers=headers, timeout=15)
+
+    if response.status_code == 400:
+        raise ValueError(f"VocaDB API 400 Error. Ответ сервера: {response.text}")
+
+    response.raise_for_status()
+    data = response.json()
+
+    songs = []
+    for item in data.get("items", []):
+        pvs = item.get("pvs", [])
+        # Ищем рабочую ссылку на YouTube
+        yt_pv = next((pv for pv in pvs if pv.get("service") == "Youtube"), None)
+
+        if yt_pv:
+            songs.append({
+                "song_id": item.get("id"),
+                "title": item.get("name"),
+                "song_type": item.get("songType"),
+                "pv_url": yt_pv.get("url"),
+                "pv_id": yt_pv.get("pvId"),
+                "publish_date": item.get("publishDate"),
+            })
+
+    return songs
 
 def get_song_candidates_for_producer(
 	producer_name: str,
