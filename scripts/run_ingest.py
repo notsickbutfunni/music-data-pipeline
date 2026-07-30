@@ -112,6 +112,24 @@ def main(argv: list[str] | None = None) -> int:
     else:
         LOGGER.info("Сбор завершен! Всего продюсеров: %d, всего песен с видео: %d", 
                     summary["total_producers_processed"], summary["total_songs_found"])
+    out_dir = ROOT_DIR / "data"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "ingest_output.json"
+
+    # 2. Сохраняем итоговый JSON в файл
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    LOGGER.info("Данные успешно сохранены в %s", out_file)
+
+    if args.json:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+    else:
+        LOGGER.info(
+            "Сбор завершен! Всего продюсеров: %d, всего песен с видео: %d",
+            summary["total_producers_processed"],
+            summary["total_songs_found"],
+        )
 
     return 0
 

@@ -1,65 +1,80 @@
-import argparse
+import json
 import logging
 from pathlib import Path
-import sys
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 from src.downloader import AudioDownloader
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("downloader_runner")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Test downloading a song preview")
-    parser.add_argument("url", help="YouTube or NicoNico URL")
-    parser.add_argument("song_id", help="Unique ID for the song to name the file")
-    parser.add_argument("--duration", type=int, default=30, help="Duration in seconds")
-    parser.add_argument("--start-sec", type=int, default=15, help="Preview start offset in seconds")
-    parser.add_argument("--output-dir", default="downloads", help="Directory to save the preview")
-    parser.add_argument("--codec", default="mp3", help="Output codec/extension (default: mp3)")
-    parser.add_argument(
-        "--bitrate-kbps",
-        type=int,
-        default=64,
-        help="Target bitrate in kbps for preview output (default: 64)",
-    )
-    parser.add_argument(
-        "--cache-namespace",
-        default="v1",
-        help="Version namespace used in deterministic cache keys",
+    json_path = Path("data/ingest_output.json")
+    
+    if not json_path.exists():
+        logger.error("Файл %s не найден! Сначала запусти инжестор.", json_path)
+        return
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    downloader = AudioDownloader(download_dir="data/downloads")
+
+    producers = payload.get("data", [])
+    total_songs = 0
+    successful_downloads = 0
+
+    logger.info("Начало скачивания сэмплов для %d продюсеров...", len(producers))
+
+    # 3. Проходим по каждому продюсеру и его трекам
+    for producer in producers:
+        p_name = producer.get("producer_name", "Unknown")
+        songs = producer.get("songs", [])
+        
+        logger.info("--- Продюсер: %s (%d песен) ---", p_name, len(songs))
+
+        for song in songs:
+            total_songs += 1
+            song_id = song.get("song_id") or song.get("id")
+            pv_url = song.get("pv_url")
+
+            # Если ссылки нет в pv_url, проверяем массив pvs (если он есть)
+            if not pv_url and song.get("pvs"):
+                pvs = song.get("pvs", [])
+                pv_url = next((pv.get("url") for pv in pvs if pv.get("service") == "YouTube"), None)
+                if not pv_url and pvs:
+                    pv_url = pvs[0].get("url")
+
+            if not pv_url or not song_id:
+                logger.warning("У песни %s (ID: %s) нет ссылки на PV. Пропускаем.", song.get("title") or song.get("name"), song_id)
+                continue
+
+            # Скачиваем 15 секунд, перехватывая ошибки недоступных видео
+            try:
+                sample_path = downloader.download_preview(
+                    url=pv_url,
+                    song_id=song_id,
+                    start_sec=45,
+                    duration_sec=15,
+                    bitrate_kbps=128
+                )
+                if sample_path:
+                    successful_downloads += 1
+            except Exception as err:
+                logger.warning("Пропуск трека %s (song_id=%s) из-за ошибки: %s", pv_url, song_id, err)
+                continue
+            
+
+    logger.info(
+        "Скачивание завершено! Успешно обработано: %d из %d сэмплов.",
+        successful_downloads,
+        total_songs
     )
 
-    args = parser.parse_args()
-
-    downloader = AudioDownloader(download_dir=args.output_dir, cache_namespace=args.cache_namespace)
-    cache_key = downloader.build_cache_key(
-        url=args.url,
-        song_id=args.song_id,
-        duration_sec=args.duration,
-        codec=args.codec,
-        bitrate_kbps=args.bitrate_kbps,
-    )
-    expected_name = f"{cache_key}.{args.codec.strip().lower()}"
-    print(f"Downloading {args.url} -> {args.output_dir}/{expected_name} (max {args.duration}s)...")
-    
-    result = downloader.download_preview(
-        args.url,
-        args.song_id,
-        start_sec=args.start_sec,
-        duration_sec=args.duration,
-        codec=args.codec,
-        bitrate_kbps=args.bitrate_kbps,
-        cache_key=cache_key,
-    )
-    
-    if result:
-        print(f"Success! Saved to {result}")
-        return 0
-    else:
-        print("Failed to download.")
-        return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -88,17 +88,32 @@ class AudioDownloader:
         ydl_opts = {
             'format': 'ba/ba*',  # Берем только лучший аудиопоток
             'outtmpl': str(self.download_dir / f"{resolved_key}.%(ext)s"),
-            'download_sections': [time_section],  # Стримит ТОЛЬКО нужный отрезок
             'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
             'socket_timeout': self.timeout,
             'retries': self.retries,
+            'http_headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/125.0.0.0 Safari/537.36'
+                ),
+            },
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                }
+            },
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': resolved_codec,
                 'preferredquality': str(bitrate_kbps),
             }],
+            'postprocessor_args': [
+            '-ss', str(start_sec),
+            '-t', str(duration_sec)
+            ],
         }
 
         try:
